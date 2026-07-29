@@ -70,4 +70,5 @@ def fs_node_table(engine: Engine, backend: str) -> Iterator[Engine]:
 
 @pytest.fixture
 def sql_fs(fs_node_table: Engine, db_url: str) -> SQLFileSystem:
+    fsspec.register_implementation("sql", SQLFileSystem, clobber=True)
     return fsspec.filesystem("sql", url=db_url, table="fs_node")

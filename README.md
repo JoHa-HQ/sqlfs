@@ -23,11 +23,13 @@ sqlfs does **not** create or own the table. The client creates the
 
 ## Usage
 
-Bind the adapter to the `"sql"` protocol, then use it through fsspec:
+Register the `"sql"` protocol on the client side, then use it through fsspec:
 
 ```python
 import fsspec
-import sqlfs  # registers the "sql" protocol
+from sqlfs import SQLFileSystem
+
+fsspec.register_implementation("sql", SQLFileSystem)
 
 fs = fsspec.filesystem(
     "sql",
