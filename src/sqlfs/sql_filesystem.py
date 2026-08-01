@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import posixpath
 import time
 from io import BytesIO
 from os import PathLike
+from pathlib import PurePosixPath
 from typing import Any
 
 from fsspec.spec import AbstractFileSystem
@@ -68,19 +68,15 @@ class SQLFileSystem(AbstractFileSystem):
     @classmethod
     def _strip_protocol(cls, path: str | PathLike[str]) -> str:
         stripped = super()._strip_protocol(path)
-        normalized = posixpath.normpath(f"/{stripped.lstrip('/')}")
-        return "/" if normalized == "/." else normalized
+        return str(PurePosixPath(f"/{stripped.lstrip('/')}"))
 
     @classmethod
     def _parent(cls, path: str) -> str:
-        if path == "/":
+        posix_path = PurePosixPath(path)
+        if posix_path == PurePosixPath("/"):
             return ""
-        parent = posixpath.dirname(path)
-        return "" if parent == "/" else parent
-
-    @staticmethod
-    def _escape_like(value: str) -> str:
-        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        parent = posix_path.parent
+        return "" if parent == PurePosixPath("/") else str(parent)
 
     def _row(self, path: str) -> RowMapping | None:
         with self.engine.connect() as connection:
@@ -105,21 +101,42 @@ class SQLFileSystem(AbstractFileSystem):
             "created": row["ctime"],
         }
 
-    def _ensure_dir(self, path: str) -> None:
+    def mkdir(
+        self,
+        path: str,
+        create_parents: bool = True,
+        exist_ok: bool = False,
+        **kwargs: Any,
+    ) -> None:
         path = self._strip_protocol(path)
         if path == "/":
+            if not exist_ok:
+                raise FileExistsError(path)
             return
 
         row = self._row(path)
         if row is not None:
-            if row["type"] != "dir":
+            info = self._info_from_row(row)
+            if info["type"] != "directory":
+                raise FileExistsError(path)
+            if not exist_ok:
                 raise FileExistsError(path)
             return
 
         parent = self._parent(path)
-        self._ensure_dir(parent or "/")
-        now = time.time()
+        if create_parents:
+            if parent:
+                # Intermediate parents may already exist.
+                self.mkdir(parent, create_parents=True, exist_ok=True)
+        elif parent:
+            parent_row = self._row(parent)
+            if parent_row is None:
+                raise FileNotFoundError(parent)
+            parent_info = self._info_from_row(parent_row)
+            if parent_info["type"] != "directory":
+                raise NotADirectoryError(parent)
 
+        now = time.time()
         with self.engine.begin() as connection:
             connection.execute(
                 self._table.insert().values(
@@ -135,33 +152,8 @@ class SQLFileSystem(AbstractFileSystem):
                 )
             )
 
-    def mkdir(self, path: str, create_parents: bool = True, **kwargs: Any) -> None:
-        path = self._strip_protocol(path)
-        if path == "/":
-            return
-        if create_parents:
-            self._ensure_dir(path)
-            return
-
-        parent = self._parent(path)
-        if parent:
-            parent_row = self._row(parent)
-            if parent_row is None:
-                raise FileNotFoundError(parent)
-            if parent_row["type"] != "dir":
-                raise NotADirectoryError(parent)
-        self._ensure_dir(path)
-
     def makedirs(self, path: str, exist_ok: bool = False) -> None:
-        path = self._strip_protocol(path)
-        row = None if path == "/" else self._row(path)
-        if path == "/" or row is not None:
-            if row is not None and row["type"] != "dir":
-                raise FileExistsError(path)
-            if not exist_ok:
-                raise FileExistsError(path)
-            return
-        self._ensure_dir(path)
+        self.mkdir(path, create_parents=True, exist_ok=exist_ok)
 
     def pipe_file(
         self,
@@ -181,12 +173,13 @@ class SQLFileSystem(AbstractFileSystem):
         payload = bytes(value)
         content = payload.decode("utf-8")
         parent = self._parent(path)
-        self._ensure_dir(parent or "/")
+        self.mkdir(parent or "/", create_parents=True, exist_ok=True)
         now = time.time()
         row = self._row(path)
 
         if row is not None:
-            if row["type"] == "dir":
+            info = self._info_from_row(row)
+            if info["type"] == "directory":
                 raise IsADirectoryError(path)
             self._update_file(path, content, len(payload), now)
             return
@@ -233,10 +226,11 @@ class SQLFileSystem(AbstractFileSystem):
         row = self._row(path)
         if row is None:
             raise FileNotFoundError(path)
-        if row["type"] != "file":
+        info = self._info_from_row(row)
+        if info["type"] != "file":
             raise IsADirectoryError(path)
 
-        content = row["content"] or ""
+        content = row.get("content") or ""
         data = content if isinstance(content, bytes) else content.encode("utf-8")
         with self.engine.begin() as connection:
             connection.execute(
@@ -267,8 +261,8 @@ class SQLFileSystem(AbstractFileSystem):
             row = self._row(path)
             if row is None:
                 raise FileNotFoundError(path)
-            if row["type"] == "file":
-                info = self._info_from_row(row)
+            info = self._info_from_row(row)
+            if info["type"] == "file":
                 return [info] if detail else [path]
 
         parent = "" if path == "/" else path
@@ -291,7 +285,8 @@ class SQLFileSystem(AbstractFileSystem):
         row = self._row(path)
         if row is None:
             raise FileNotFoundError(path)
-        if row["type"] == "dir":
+        info = self._info_from_row(row)
+        if info["type"] == "directory":
             raise IsADirectoryError(path)
         with self.engine.begin() as connection:
             connection.execute(delete(self._table).where(self._table.c.path == path))
@@ -318,7 +313,8 @@ class SQLFileSystem(AbstractFileSystem):
         row = self._row(path)
         if row is None:
             raise FileNotFoundError(path)
-        if row["type"] == "file":
+        info = self._info_from_row(row)
+        if info["type"] == "file":
             self.rm_file(path)
             return
 
@@ -336,7 +332,9 @@ class SQLFileSystem(AbstractFileSystem):
                 )
                 return
 
-            escaped_path = self._escape_like(path)
+            escaped_path = (
+                path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
             descendants = self._table.c.path.like(f"{escaped_path}/%", escape="\\")
             connection.execute(
                 delete(self._table).where((self._table.c.path == path) | descendants)
@@ -351,6 +349,12 @@ class SQLFileSystem(AbstractFileSystem):
         cache_options: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> BytesIO:
+        """Return a file-like object backed by an in-memory buffer.
+
+        We store each file as one JSON value in SQL, so opening a file means
+        reading or writing that whole value at once. ``OpenFile`` is handled by
+        fsspec above this method; here we only return the raw buffer.
+        """
         path = self._strip_protocol(path)
         if mode == "rb":
             return BytesIO(self.cat_file(path))

@@ -59,12 +59,26 @@ def test_ls_empty_dir(sql_fs: SQLFileSystem) -> None:
     assert sql_fs.ls("/empty", detail=False) == []
 
 
-def test_glob_data_files(sql_fs: SQLFileSystem) -> None:
+@pytest.mark.parametrize(
+    ("pattern", "expected"),
+    [
+        ("/cv/*/data", {"/cv/1/data", "/cv/2/data"}),
+        ("/cv/*", {"/cv/1", "/cv/2"}),
+        ("/cv/**/data", {"/cv/1/data", "/cv/2/data"}),
+        ("/**/data", {"/cv/1/data", "/cv/2/data"}),
+        ("/cv/2/m?ta", {"/cv/2/meta"}),
+        ("/cv/*/m*", {"/cv/2/meta"}),
+        ("/cv/1/data", {"/cv/1/data"}),
+        ("/nope/*", set()),
+    ],
+)
+def test_glob_patterns(sql_fs: SQLFileSystem, pattern: str, expected: set[str]) -> None:
     sql_fs.pipe_file("/cv/1/data", b'{"id": "1"}')
     sql_fs.pipe_file("/cv/2/data", b'{"id": "2"}')
     sql_fs.pipe_file("/cv/2/meta", b'{"tags": []}')
+    sql_fs.pipe_file("/cv/1/nested/x", b'{"x": 1}')
 
-    assert set(sql_fs.glob("/cv/*/data")) == {"/cv/1/data", "/cv/2/data"}
+    assert set(sql_fs.glob(pattern)) == expected
 
 
 def test_info_file_and_dir(sql_fs: SQLFileSystem) -> None:
