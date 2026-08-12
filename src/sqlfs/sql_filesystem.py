@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from io import BytesIO
 from os import PathLike
@@ -8,6 +9,7 @@ from typing import Any
 
 from fsspec.spec import AbstractFileSystem
 from sqlalchemy import MetaData, Table, create_engine, delete, select, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import NoSuchTableError
 
@@ -64,6 +66,26 @@ class SQLFileSystem(AbstractFileSystem):
             raise ValueError(
                 f"SQL filesystem table {table!r} is missing required columns: {missing}"
             )
+
+        self._json_document_content = isinstance(self._table.c.content.type, JSONB)
+
+    def _encode_content_for_storage(
+        self, payload: bytes
+    ) -> str | dict[str, Any] | list[Any]:
+        text = payload.decode("utf-8")
+        if self._json_document_content:
+            return json.loads(text)
+        return text
+
+    @staticmethod
+    def _decode_content_from_storage(content: Any) -> bytes:
+        if content is None:
+            return b""
+        if isinstance(content, bytes):
+            return content
+        if isinstance(content, (dict, list)):
+            return json.dumps(content, ensure_ascii=False).encode("utf-8")
+        return content.encode("utf-8")
 
     @classmethod
     def _strip_protocol(cls, path: str | PathLike[str]) -> str:
@@ -171,7 +193,7 @@ class SQLFileSystem(AbstractFileSystem):
             raise FileExistsError(path)
 
         payload = bytes(value)
-        content = payload.decode("utf-8")
+        content = self._encode_content_for_storage(payload)
         parent = self._parent(path)
         self.mkdir(parent or "/", create_parents=True, exist_ok=True)
         now = time.time()
@@ -199,7 +221,11 @@ class SQLFileSystem(AbstractFileSystem):
             connection.execute(self._table.insert().values(**values))
 
     def _update_file(
-        self, path: str, content: str, size: int, timestamp: float
+        self,
+        path: str,
+        content: str | dict[str, Any] | list[Any],
+        size: int,
+        timestamp: float,
     ) -> None:
         with self.engine.begin() as connection:
             connection.execute(
@@ -230,8 +256,7 @@ class SQLFileSystem(AbstractFileSystem):
         if info["type"] != "file":
             raise IsADirectoryError(path)
 
-        content = row.get("content") or ""
-        data = content if isinstance(content, bytes) else content.encode("utf-8")
+        data = self._decode_content_from_storage(row.get("content"))
         with self.engine.begin() as connection:
             connection.execute(
                 update(self._table)

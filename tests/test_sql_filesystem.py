@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 import sqlfs.sql_filesystem as sql_filesystem_module
@@ -184,24 +183,8 @@ def test_file_metadata_and_timestamps(
     assert sql_fs.info("/cv/1/data")["atime"] == READ_AT
 
 
-def test_content_type_is_required_by_schema(engine: Engine, db_url: str) -> None:
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                CREATE TABLE incomplete_node (
-                    path TEXT PRIMARY KEY,
-                    parent TEXT NOT NULL,
-                    type TEXT NOT NULL,
-                    content TEXT,
-                    size INTEGER NOT NULL,
-                    atime REAL,
-                    mtime REAL,
-                    ctime REAL
-                )
-                """
-            )
-        )
-
+def test_content_type_is_required_by_schema(
+    db_url: str, incomplete_node_table: Engine
+) -> None:
     with pytest.raises(ValueError, match="content_type"):
         SQLFileSystem(url=db_url, table="incomplete_node")
