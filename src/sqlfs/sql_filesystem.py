@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import time
 from io import BytesIO
 from os import PathLike
@@ -8,8 +7,17 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from fsspec.spec import AbstractFileSystem
-from sqlalchemy import MetaData, Table, create_engine, delete, select, update
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import (
+    MetaData,
+    Table,
+    Text,
+    cast,
+    create_engine,
+    delete,
+    select,
+    type_coerce,
+    update,
+)
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import NoSuchTableError
 
@@ -67,24 +75,18 @@ class SQLFileSystem(AbstractFileSystem):
                 f"SQL filesystem table {table!r} is missing required columns: {missing}"
             )
 
-        self._json_document_content = isinstance(self._table.c.content.type, JSONB)
-
-    def _encode_content_for_storage(
-        self, payload: bytes
-    ) -> str | dict[str, Any] | list[Any]:
-        text = payload.decode("utf-8")
-        if self._json_document_content:
-            return json.loads(text)
-        return text
+    def _node_columns(self) -> list[Any]:
+        return [
+            cast(column, Text).label("content") if column.name == "content" else column
+            for column in self._table.c
+        ]
 
     @staticmethod
-    def _decode_content_from_storage(content: Any) -> bytes:
+    def _content_as_bytes(content: Any) -> bytes:
         if content is None:
             return b""
         if isinstance(content, bytes):
             return content
-        if isinstance(content, (dict, list)):
-            return json.dumps(content, ensure_ascii=False).encode("utf-8")
         return content.encode("utf-8")
 
     @classmethod
@@ -104,7 +106,7 @@ class SQLFileSystem(AbstractFileSystem):
         with self.engine.connect() as connection:
             return (
                 connection.execute(
-                    select(self._table).where(self._table.c.path == path)
+                    select(*self._node_columns()).where(self._table.c.path == path)
                 )
                 .mappings()
                 .first()
@@ -193,7 +195,10 @@ class SQLFileSystem(AbstractFileSystem):
             raise FileExistsError(path)
 
         payload = bytes(value)
-        content = self._encode_content_for_storage(payload)
+        # Bind as Text, then CAST to the reflected column type (TEXT / JSONB).
+        content = cast(
+            type_coerce(payload.decode("utf-8"), Text), self._table.c.content.type
+        )
         parent = self._parent(path)
         self.mkdir(parent or "/", create_parents=True, exist_ok=True)
         now = time.time()
@@ -223,7 +228,7 @@ class SQLFileSystem(AbstractFileSystem):
     def _update_file(
         self,
         path: str,
-        content: str | dict[str, Any] | list[Any],
+        content: Any,
         size: int,
         timestamp: float,
     ) -> None:
@@ -256,7 +261,7 @@ class SQLFileSystem(AbstractFileSystem):
         if info["type"] != "file":
             raise IsADirectoryError(path)
 
-        data = self._decode_content_from_storage(row.get("content"))
+        data = self._content_as_bytes(row.get("content"))
         with self.engine.begin() as connection:
             connection.execute(
                 update(self._table)
@@ -294,7 +299,7 @@ class SQLFileSystem(AbstractFileSystem):
         with self.engine.connect() as connection:
             rows = (
                 connection.execute(
-                    select(self._table)
+                    select(*self._node_columns())
                     .where(self._table.c.parent == parent)
                     .order_by(self._table.c.path)
                 )

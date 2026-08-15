@@ -183,8 +183,7 @@ def test_file_metadata_and_timestamps(
     assert sql_fs.info("/cv/1/data")["atime"] == READ_AT
 
 
-def test_content_type_is_required_by_schema(
-    db_url: str, incomplete_node_table: Engine
-) -> None:
+def test_content_type_is_required_by_schema(incomplete_node_table: Engine) -> None:
+    url = incomplete_node_table.url.render_as_string(hide_password=False)
     with pytest.raises(ValueError, match="content_type"):
-        SQLFileSystem(url=db_url, table="incomplete_node")
+        SQLFileSystem(url=url, table="incomplete_node")
