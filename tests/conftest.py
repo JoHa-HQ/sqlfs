@@ -3,14 +3,15 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 
-import fsspec
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from testcontainers.community.postgres import PostgresContainer
 
 from sqlfs import SQLFileSystem
 
-FS_NODE_DDL_SQLITE = """
+FS_NODE_DDL = {
+    "sqlite": """
 CREATE TABLE fs_node (
     path         TEXT PRIMARY KEY,
     parent       TEXT NOT NULL,
@@ -23,52 +24,111 @@ CREATE TABLE fs_node (
     ctime        REAL
 );
 CREATE INDEX ix_fs_node_parent ON fs_node(parent);
-"""
+""",
+    "postgresql": """
+CREATE TABLE fs_node (
+    path         TEXT PRIMARY KEY,
+    parent       TEXT NOT NULL,
+    type         TEXT NOT NULL CHECK (type IN ('file', 'dir')),
+    content_type TEXT,
+    content      JSONB,
+    size         INTEGER NOT NULL DEFAULT 0,
+    atime        DOUBLE PRECISION,
+    mtime        DOUBLE PRECISION,
+    ctime        DOUBLE PRECISION
+);
+CREATE INDEX ix_fs_node_parent ON fs_node(parent);
+""",
+}
+
+INCOMPLETE_NODE_DDL = {
+    "sqlite": """
+CREATE TABLE incomplete_node (
+    path TEXT PRIMARY KEY,
+    parent TEXT NOT NULL,
+    type TEXT NOT NULL,
+    content TEXT,
+    size INTEGER NOT NULL,
+    atime REAL,
+    mtime REAL,
+    ctime REAL
+)
+""",
+    "postgresql": """
+CREATE TABLE incomplete_node (
+    path TEXT PRIMARY KEY,
+    parent TEXT NOT NULL,
+    type TEXT NOT NULL,
+    content JSONB,
+    size INTEGER NOT NULL,
+    atime DOUBLE PRECISION,
+    mtime DOUBLE PRECISION,
+    ctime DOUBLE PRECISION
+)
+""",
+}
 
 
-@pytest.fixture(params=["sqlite"])
-def backend(request: pytest.FixtureRequest) -> str:
-    return request.param
+@pytest.fixture(scope="session")
+def postgres_container() -> Iterator[PostgresContainer]:
+    with PostgresContainer("postgres:16-alpine") as container:
+        yield container
 
 
-@pytest.fixture
-def db_url(backend: str, tmp_path: Path) -> str:
-    if backend == "sqlite":
-        return f"sqlite:///{tmp_path / 'test.db'}"
-    raise NotImplementedError(f"unsupported backend: {backend}")
-
-
-@pytest.fixture
-def engine(db_url: str) -> Iterator[Engine]:
-    eng = create_engine(db_url)
+@pytest.fixture(scope="session")
+def postgres_engine(postgres_container: PostgresContainer) -> Iterator[Engine]:
+    engine = create_engine(postgres_container.get_connection_url(driver="psycopg"))
     try:
-        yield eng
+        yield engine
     finally:
-        eng.dispose()
+        engine.dispose()
 
 
 @pytest.fixture
-def fs_node_table(engine: Engine, backend: str) -> Iterator[Engine]:
+def sqlite_engine(tmp_path: Path) -> Iterator[Engine]:
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def engine(request: pytest.FixtureRequest) -> Engine:
+    if request.param == "sqlite":
+        return request.getfixturevalue("sqlite_engine")
+    if request.param == "postgres":
+        return request.getfixturevalue("postgres_engine")
+    raise ValueError(f"unsupported backend type: {request.param}")
+
+
+@pytest.fixture
+def fs_node_table(engine: Engine) -> Iterator[Engine]:
     """Create a clean fs_node table for each test."""
-    if backend == "sqlite":
-        ddl = FS_NODE_DDL_SQLITE
-    else:
-        raise NotImplementedError(f"unsupported backend: {backend}")
-
-    statements = [stmt.strip() for stmt in ddl.split(";") if stmt.strip()]
-
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS fs_node"))
-        for stmt in statements:
-            conn.execute(text(stmt))
-
+        for stmt in FS_NODE_DDL[engine.dialect.name].split(";"):
+            if stmt.strip():
+                conn.execute(text(stmt))
     yield engine
-
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS fs_node"))
 
 
 @pytest.fixture
-def sql_fs(fs_node_table: Engine, db_url: str) -> SQLFileSystem:
-    fsspec.register_implementation("sql", SQLFileSystem, clobber=True)
-    return fsspec.filesystem("sql", url=db_url, table="fs_node")
+def incomplete_node_table(engine: Engine) -> Iterator[Engine]:
+    """Create a schema-invalid table missing content_type for contract tests."""
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS incomplete_node"))
+        for stmt in INCOMPLETE_NODE_DDL[engine.dialect.name].split(";"):
+            if stmt.strip():
+                conn.execute(text(stmt))
+    yield engine
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS incomplete_node"))
+
+
+@pytest.fixture
+def sql_fs(fs_node_table: Engine) -> SQLFileSystem:
+    url = fs_node_table.url.render_as_string(hide_password=False)
+    return SQLFileSystem(url=url, table="fs_node")
