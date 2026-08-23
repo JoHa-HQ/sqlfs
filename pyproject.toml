@@ -17,6 +17,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "prek>=0.4.9",
+    "commitizen>=4.16.2",
     "psycopg[binary]>=3.2",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -27,6 +28,13 @@ dev = [
     "hatch-vcs>=0.5.0",
 ]
 
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "scm"
+version_schema = "semver"
+tag_format = "v$version"
+update_changelog_on_bump = true
+
 [tool.hatch.build.hooks.vcs]
 version-file = "src/sqlfs/_version.py"
 
@@ -36,8 +44,6 @@ packages = ["src/sqlfs"]
 [tool.hatch.version]
 source = "vcs"
 
-[tool.hatch.version.vcs]
-tag = ""
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
