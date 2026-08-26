@@ -6,20 +6,69 @@ fsspec adapter backed by SQL.
 Paths form a tree and file bodies are stored as JSON. Works over SQLite and
 PostgreSQL via SQLAlchemy.
 
-Scope is synchronous path CRUD: `pipe`/`cat`, `ls`, `glob`, `rm`, `info`.
-
-
-## Setup
+## Installation
 
 ```bash
-uv sync
+pip install sqlfs
+```
+
+Or with `uv`:
+
+```bash
+uv add sqlfs
+```
+
+## Development setup
+
+```bash
+uv sync --group dev
 prek install
 ```
 
-## Schema ownership
+## Current scope
 
-sqlfs does **not** create or own the table. The client creates the
-`fs_node` table; sqlfs connects and validates the contract on startup.
+- synchronous filesystem operations only
+- path CRUD via `pipe`/`cat`, `ls`, `glob`, `rm`, `info`, and `open`
+- SQLite and PostgreSQL backends via SQLAlchemy
+- file payloads are stored as JSON with `content_type = "application/json"`
+- table creation and migrations stay on the client side
+
+## Schema contract
+
+`sqlfs` does **not** create or own the table. The client creates the
+`fs_node` table; `sqlfs` connects and validates the contract on startup.
+
+Required columns:
+
+- `path`
+- `parent`
+- `type` (`file` or `dir`)
+- `content_type`
+- `content`
+- `size`
+- `atime`
+- `mtime`
+- `ctime`
+
+A minimal SQLite-compatible schema looks like this:
+
+```sql
+CREATE TABLE fs_node (
+    path         TEXT PRIMARY KEY,
+    parent       TEXT NOT NULL,
+    type         TEXT NOT NULL CHECK (type IN ('file', 'dir')),
+    content_type TEXT,
+    content      TEXT,
+    size         INTEGER NOT NULL DEFAULT 0,
+    atime        REAL,
+    mtime        REAL,
+    ctime        REAL
+);
+
+CREATE INDEX ix_fs_node_parent ON fs_node(parent);
+```
+
+For PostgreSQL, `content` can be a JSON-capable type such as `JSONB`.
 
 ## Usage
 
@@ -55,3 +104,5 @@ with fs.open("/cv/1/data", "wb") as f:
 ```bash
 uv run pytest
 ```
+
+The PostgreSQL test cases use `testcontainers` and require Docker.
