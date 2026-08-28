@@ -9,13 +9,13 @@ PostgreSQL via SQLAlchemy.
 ## Installation
 
 ```bash
-pip install sqlfs
+pip install joha-sqlfs
 ```
 
 Or with `uv`:
 
 ```bash
-uv add sqlfs
+uv add joha-sqlfs
 ```
 
 ## Development setup
