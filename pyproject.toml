@@ -3,7 +3,7 @@ requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
-name = "sqlfs"
+name = "joha-sqlfs"
 dynamic = ["version"]
 description = "fsspec adapter backed by SQL"
 readme = "README.md"
