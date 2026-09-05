@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import pytest
@@ -9,6 +9,21 @@ from sqlalchemy.engine import Engine
 from testcontainers.community.postgres import PostgresContainer
 
 from sqlfs import SQLFileSystem
+
+_ASYNC_DRIVERS = {
+    "sqlite": "sqlite+aiosqlite",
+    "postgresql": "postgresql+asyncpg",
+}
+
+
+def _async_url(engine: Engine) -> str:
+    """Rewrite a sync Engine URL to the matching async driver."""
+    try:
+        drivername = _ASYNC_DRIVERS[engine.dialect.name]
+    except KeyError as exc:
+        raise ValueError(f"unsupported dialect: {engine.dialect.name}") from exc
+    return engine.url.set(drivername=drivername).render_as_string(hide_password=False)
+
 
 FS_NODE_DDL = {
     "sqlite": """
@@ -129,6 +144,20 @@ def incomplete_node_table(engine: Engine) -> Iterator[Engine]:
 
 
 @pytest.fixture
-def sql_fs(fs_node_table: Engine) -> SQLFileSystem:
-    url = fs_node_table.url.render_as_string(hide_password=False)
-    return SQLFileSystem(url=url, table="fs_node")
+def sql_fs_url(fs_node_table: Engine) -> str:
+    return _async_url(fs_node_table)
+
+
+@pytest.fixture
+def incomplete_async_url(incomplete_node_table: Engine) -> str:
+    return _async_url(incomplete_node_table)
+
+
+@pytest.fixture
+async def sql_fs(sql_fs_url: str) -> AsyncIterator[SQLFileSystem]:
+    fs = SQLFileSystem(sql_fs_url, table="fs_node", asynchronous=True)
+    await fs._load_table()
+    try:
+        yield fs
+    finally:
+        await fs.engine.dispose()
