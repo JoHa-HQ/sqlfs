@@ -4,7 +4,7 @@ fsspec adapter backed by SQL.
 
 `sqlfs` exposes a single node table as an fsspec filesystem (`protocol = "sql"`).
 Paths form a tree and file bodies are stored as JSON. Works over SQLite and
-PostgreSQL via SQLAlchemy.
+PostgreSQL via SQLAlchemy async drivers.
 
 ## Installation
 
@@ -27,16 +27,18 @@ prek install
 
 ## Current scope
 
-- synchronous filesystem operations only
-- path CRUD via `pipe`/`cat`, `ls`, `glob`, `rm`, `info`, and `open`
-- SQLite and PostgreSQL backends via SQLAlchemy
+- async filesystem operations via SQLAlchemy `AsyncEngine` (`AsyncFileSystem`)
+- path CRUD via `_pipe_file` / `_cat_file`, `_ls`, `_glob`, `_rm`, `_info`, …
+- SQLite (`aiosqlite`) and PostgreSQL (`asyncpg`) backends
 - file payloads are stored as JSON with `content_type = "application/json"`
 - table creation and migrations stay on the client side
+- `open()` / file-like writers are not fully adapted yet (use pipe/cat)
 
 ## Schema contract
 
 `sqlfs` does **not** create or own the table. The client creates the
-`fs_node` table; `sqlfs` connects and validates the contract on startup.
+`fs_node` table; after construct, call `await fs._load_table()` to reflect and
+validate the schema.
 
 Required columns:
 
@@ -72,31 +74,37 @@ For PostgreSQL, `content` can be a JSON-capable type such as `JSONB`.
 
 ## Usage
 
-Register the `"sql"` protocol on the client side, then use it through fsspec:
+Use an **async** SQLAlchemy URL (`sqlite+aiosqlite://…` or
+`postgresql+asyncpg://…`). Construct is sync; schema load and I/O are async:
 
 ```python
+import asyncio
+
 import fsspec
 from sqlfs import SQLFileSystem
 
 fsspec.register_implementation("sql", SQLFileSystem)
 
-fs = fsspec.filesystem(
-    "sql",
-    url="sqlite:///app.db",   # or "postgresql+psycopg://user:pass@host/db"
-    table="fs_node",
-)
 
-fs.pipe_file("/cv/1/data", b'{"name": "John Doe"}')
-fs.cat("/cv/1/data")          # b'{"name": "John Doe"}'
-fs.ls("/cv")                  # ["/cv/1"]
-fs.glob("/cv/*/data")         # ["/cv/1/data"]
-```
+async def main() -> None:
+    fs = fsspec.filesystem(
+        "sql",
+        url="sqlite+aiosqlite:///app.db",
+        # or "postgresql+asyncpg://user:pass@host/db"
+        table="fs_node",
+        asynchronous=True,
+    )
+    await fs._load_table()
 
-File-like access works too:
+    await fs._pipe_file("/cv/1/data", b'{"name": "John Doe"}')
+    print(await fs._cat_file("/cv/1/data"))  # b'{"name": "John Doe"}'
+    print(await fs._ls("/cv", detail=False))  # ["/cv/1"]
+    print(await fs._glob("/cv/*/data"))  # ["/cv/1/data"]
 
-```python
-with fs.open("/cv/1/data", "wb") as f:
-    f.write(b'{"name": "John Doe"}')
+    await fs.engine.dispose()
+
+
+asyncio.run(main())
 ```
 
 ## Tests

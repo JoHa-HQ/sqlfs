@@ -6,13 +6,12 @@ from os import PathLike
 from pathlib import PurePosixPath
 from typing import Any
 
-from fsspec.spec import AbstractFileSystem
+from fsspec.asyn import AsyncFileSystem
 from sqlalchemy import (
     MetaData,
     Table,
     Text,
     cast,
-    create_engine,
     delete,
     select,
     type_coerce,
@@ -20,6 +19,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import NoSuchTableError
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 REQUIRED_COLUMNS = frozenset(
     {
@@ -51,7 +51,7 @@ class _SQLFileWriter(BytesIO):
                 super().close()
 
 
-class SQLFileSystem(AbstractFileSystem):
+class SQLFileSystem(AsyncFileSystem):
     protocol = "sql"
     root_marker = "/"
 
@@ -59,26 +59,44 @@ class SQLFileSystem(AbstractFileSystem):
         super().__init__(**kwargs)
         self.url = url
         self.table_name = table
-        self.engine = create_engine(url)
+        self.engine: AsyncEngine = create_async_engine(url)
+        self._table: Table | None = None
 
+    @property
+    def table(self) -> Table:
+        if self._table is None:
+            raise RuntimeError(
+                "SQL filesystem table is not loaded; call await fs._load_table() first"
+            )
+        return self._table
+
+    async def _load_table(self) -> None:
         try:
-            self._table = Table(table, MetaData(), autoload_with=self.engine)
+            async with self.engine.connect() as connection:
+                self._table = await connection.run_sync(
+                    lambda sync_conn: Table(
+                        self.table_name, MetaData(), autoload_with=sync_conn
+                    )
+                )
         except NoSuchTableError as exc:
-            self.engine.dispose()
-            raise ValueError(f"SQL filesystem table does not exist: {table!r}") from exc
+            await self.engine.dispose()
+            raise ValueError(
+                f"SQL filesystem table does not exist: {self.table_name!r}"
+            ) from exc
 
-        missing_columns = REQUIRED_COLUMNS.difference(self._table.c.keys())
+        missing_columns = REQUIRED_COLUMNS.difference(self.table.c.keys())
         if missing_columns:
-            self.engine.dispose()
+            await self.engine.dispose()
             missing = ", ".join(sorted(missing_columns))
             raise ValueError(
-                f"SQL filesystem table {table!r} is missing required columns: {missing}"
+                f"SQL filesystem table {self.table_name!r} "
+                f"is missing required columns: {missing}"
             )
 
     def _node_columns(self) -> list[Any]:
         return [
             cast(column, Text).label("content") if column.name == "content" else column
-            for column in self._table.c
+            for column in self.table.c
         ]
 
     @staticmethod
@@ -102,15 +120,12 @@ class SQLFileSystem(AbstractFileSystem):
         parent = posix_path.parent
         return "" if parent == PurePosixPath("/") else str(parent)
 
-    def _row(self, path: str) -> RowMapping | None:
-        with self.engine.connect() as connection:
-            return (
-                connection.execute(
-                    select(*self._node_columns()).where(self._table.c.path == path)
-                )
-                .mappings()
-                .first()
+    async def _row(self, path: str) -> RowMapping | None:
+        async with self.engine.connect() as connection:
+            result = await connection.execute(
+                select(*self._node_columns()).where(self.table.c.path == path)
             )
+            return result.mappings().first()
 
     @staticmethod
     def _info_from_row(row: RowMapping) -> dict[str, Any]:
@@ -125,7 +140,7 @@ class SQLFileSystem(AbstractFileSystem):
             "created": row["ctime"],
         }
 
-    def mkdir(
+    async def _mkdir(
         self,
         path: str,
         create_parents: bool = True,
@@ -138,7 +153,7 @@ class SQLFileSystem(AbstractFileSystem):
                 raise FileExistsError(path)
             return
 
-        row = self._row(path)
+        row = await self._row(path)
         if row is not None:
             info = self._info_from_row(row)
             if info["type"] != "directory":
@@ -151,9 +166,9 @@ class SQLFileSystem(AbstractFileSystem):
         if create_parents:
             if parent:
                 # Intermediate parents may already exist.
-                self.mkdir(parent, create_parents=True, exist_ok=True)
+                await self._mkdir(parent, create_parents=True, exist_ok=True)
         elif parent:
-            parent_row = self._row(parent)
+            parent_row = await self._row(parent)
             if parent_row is None:
                 raise FileNotFoundError(parent)
             parent_info = self._info_from_row(parent_row)
@@ -161,9 +176,9 @@ class SQLFileSystem(AbstractFileSystem):
                 raise NotADirectoryError(parent)
 
         now = time.time()
-        with self.engine.begin() as connection:
-            connection.execute(
-                self._table.insert().values(
+        async with self.engine.begin() as connection:
+            await connection.execute(
+                self.table.insert().values(
                     path=path,
                     parent=parent,
                     type="dir",
@@ -176,10 +191,10 @@ class SQLFileSystem(AbstractFileSystem):
                 )
             )
 
-    def makedirs(self, path: str, exist_ok: bool = False) -> None:
-        self.mkdir(path, create_parents=True, exist_ok=exist_ok)
+    async def _makedirs(self, path: str, exist_ok: bool = False) -> None:
+        await self._mkdir(path, create_parents=True, exist_ok=exist_ok)
 
-    def pipe_file(
+    async def _pipe_file(
         self,
         path: str,
         value: bytes,
@@ -191,24 +206,24 @@ class SQLFileSystem(AbstractFileSystem):
             raise IsADirectoryError(path)
         if mode not in {"create", "overwrite"}:
             raise ValueError(f"unsupported write mode: {mode!r}")
-        if mode == "create" and self.exists(path):
+        if mode == "create" and await self._exists(path):
             raise FileExistsError(path)
 
         payload = bytes(value)
         # Bind as Text, then CAST to the reflected column type (TEXT / JSONB).
         content = cast(
-            type_coerce(payload.decode("utf-8"), Text), self._table.c.content.type
+            type_coerce(payload.decode("utf-8"), Text), self.table.c.content.type
         )
         parent = self._parent(path)
-        self.mkdir(parent or "/", create_parents=True, exist_ok=True)
+        await self._mkdir(parent or "/", create_parents=True, exist_ok=True)
         now = time.time()
-        row = self._row(path)
+        row = await self._row(path)
 
         if row is not None:
             info = self._info_from_row(row)
             if info["type"] == "directory":
                 raise IsADirectoryError(path)
-            self._update_file(path, content, len(payload), now)
+            await self._update_file(path, content, len(payload), now)
             return
 
         values = {
@@ -222,20 +237,20 @@ class SQLFileSystem(AbstractFileSystem):
             "mtime": now,
             "ctime": now,
         }
-        with self.engine.begin() as connection:
-            connection.execute(self._table.insert().values(**values))
+        async with self.engine.begin() as connection:
+            await connection.execute(self.table.insert().values(**values))
 
-    def _update_file(
+    async def _update_file(
         self,
         path: str,
         content: Any,
         size: int,
         timestamp: float,
     ) -> None:
-        with self.engine.begin() as connection:
-            connection.execute(
-                update(self._table)
-                .where(self._table.c.path == path)
+        async with self.engine.begin() as connection:
+            await connection.execute(
+                update(self.table)
+                .where(self.table.c.path == path)
                 .values(
                     type="file",
                     content_type="application/json",
@@ -246,7 +261,7 @@ class SQLFileSystem(AbstractFileSystem):
                 )
             )
 
-    def cat_file(
+    async def _cat_file(
         self,
         path: str,
         start: int | None = None,
@@ -254,7 +269,7 @@ class SQLFileSystem(AbstractFileSystem):
         **kwargs: Any,
     ) -> bytes:
         path = self._strip_protocol(path)
-        row = self._row(path)
+        row = await self._row(path)
         if row is None:
             raise FileNotFoundError(path)
         info = self._info_from_row(row)
@@ -262,33 +277,33 @@ class SQLFileSystem(AbstractFileSystem):
             raise IsADirectoryError(path)
 
         data = self._content_as_bytes(row.get("content"))
-        with self.engine.begin() as connection:
-            connection.execute(
-                update(self._table)
-                .where(self._table.c.path == path)
+        async with self.engine.begin() as connection:
+            await connection.execute(
+                update(self.table)
+                .where(self.table.c.path == path)
                 .values(atime=time.time())
             )
         return data[start:end]
 
-    def info(self, path: str, **kwargs: Any) -> dict[str, Any]:
+    async def _info(self, path: str, **kwargs: Any) -> dict[str, Any]:
         path = self._strip_protocol(path)
         if path == "/":
             return {"name": "/", "type": "directory", "size": 0}
-        row = self._row(path)
+        row = await self._row(path)
         if row is None:
             raise FileNotFoundError(path)
         return self._info_from_row(row)
 
-    def exists(self, path: str, **kwargs: Any) -> bool:
+    async def _exists(self, path: str, **kwargs: Any) -> bool:
         path = self._strip_protocol(path)
-        return path == "/" or self._row(path) is not None
+        return path == "/" or await self._row(path) is not None
 
-    def ls(
+    async def _ls(
         self, path: str, detail: bool = True, **kwargs: Any
     ) -> list[str] | list[dict[str, Any]]:
         path = self._strip_protocol(path)
         if path != "/":
-            row = self._row(path)
+            row = await self._row(path)
             if row is None:
                 raise FileNotFoundError(path)
             info = self._info_from_row(row)
@@ -296,78 +311,81 @@ class SQLFileSystem(AbstractFileSystem):
                 return [info] if detail else [path]
 
         parent = "" if path == "/" else path
-        with self.engine.connect() as connection:
-            rows = (
-                connection.execute(
-                    select(*self._node_columns())
-                    .where(self._table.c.parent == parent)
-                    .order_by(self._table.c.path)
-                )
-                .mappings()
-                .all()
+        async with self.engine.connect() as connection:
+            result = await connection.execute(
+                select(*self._node_columns())
+                .where(self.table.c.parent == parent)
+                .order_by(self.table.c.path)
             )
+            rows = result.mappings().all()
         if detail:
             return [self._info_from_row(row) for row in rows]
         return [row["path"] for row in rows]
 
-    def rm_file(self, path: str) -> None:
+    async def _rm_file(self, path: str, **kwargs: Any) -> None:
         path = self._strip_protocol(path)
-        row = self._row(path)
+        row = await self._row(path)
         if row is None:
             raise FileNotFoundError(path)
         info = self._info_from_row(row)
         if info["type"] == "directory":
             raise IsADirectoryError(path)
-        with self.engine.begin() as connection:
-            connection.execute(delete(self._table).where(self._table.c.path == path))
+        async with self.engine.begin() as connection:
+            await connection.execute(
+                delete(self.table).where(self.table.c.path == path)
+            )
 
-    def rmdir(self, path: str) -> None:
-        self.rm(path, recursive=False)
+    async def _rmdir(self, path: str) -> None:
+        await self._rm(path, recursive=False)
 
-    def rm(
+    async def _rm(
         self,
         path: str | list[str],
         recursive: bool = False,
-        maxdepth: int | None = None,
+        batch_size: int | None = None,
+        **kwargs: Any,
     ) -> None:
+        if kwargs.get("maxdepth") is not None:
+            raise NotImplementedError("maxdepth is not supported")
+
         if isinstance(path, list):
             for item in path:
-                self.rm(item, recursive=recursive, maxdepth=maxdepth)
+                await self._rm(
+                    item, recursive=recursive, batch_size=batch_size, **kwargs
+                )
             return
-        if maxdepth is not None:
-            raise NotImplementedError("maxdepth is not supported")
 
         path = self._strip_protocol(path)
         if path == "/":
             raise ValueError("Cannot remove root")
-        row = self._row(path)
+        row = await self._row(path)
         if row is None:
             raise FileNotFoundError(path)
         info = self._info_from_row(row)
         if info["type"] == "file":
-            self.rm_file(path)
+            await self._rm_file(path)
             return
 
-        with self.engine.begin() as connection:
+        async with self.engine.begin() as connection:
             if not recursive:
-                child = connection.execute(
-                    select(self._table.c.path)
-                    .where(self._table.c.parent == path)
+                result = await connection.execute(
+                    select(self.table.c.path)
+                    .where(self.table.c.parent == path)
                     .limit(1)
-                ).first()
-                if child is not None:
+                )
+                if result.first() is not None:
                     raise OSError(f"Directory not empty: {path}")
-                connection.execute(
-                    delete(self._table).where(self._table.c.path == path)
+                await connection.execute(
+                    delete(self.table).where(self.table.c.path == path)
                 )
                 return
 
             escaped_path = (
                 path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             )
-            descendants = self._table.c.path.like(f"{escaped_path}/%", escape="\\")
-            connection.execute(
-                delete(self._table).where((self._table.c.path == path) | descendants)
+            descendants = self.table.c.path.like(f"{escaped_path}/%", escape="\\")
+            await connection.execute(
+                delete(self.table).where((self.table.c.path == path) | descendants)
             )
 
     def _open(
