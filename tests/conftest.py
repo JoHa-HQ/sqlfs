@@ -156,8 +156,8 @@ def incomplete_async_url(incomplete_node_table: Engine) -> str:
 @pytest.fixture
 async def sql_fs(sql_fs_url: str) -> AsyncIterator[SQLFileSystem]:
     fs = SQLFileSystem(sql_fs_url, table="fs_node", asynchronous=True)
-    await fs._load_table()
+    await fs._setup()
     try:
         yield fs
     finally:
-        await fs.engine.dispose()
+        await fs._close_conn()

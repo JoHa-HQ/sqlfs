@@ -37,8 +37,8 @@ prek install
 ## Schema contract
 
 `sqlfs` does **not** create or own the table. The client creates the
-`fs_node` table; after construct, call `await fs._load_table()` to reflect and
-validate the schema.
+`fs_node` table; after construct, call `await fs._setup()` to open a connection,
+reflect and validate the schema.
 
 Required columns:
 
@@ -94,14 +94,14 @@ async def main() -> None:
         table="fs_node",
         asynchronous=True,
     )
-    await fs._load_table()
+    await fs._setup()
 
     await fs._pipe_file("/cv/1/data", b'{"name": "John Doe"}')
     print(await fs._cat_file("/cv/1/data"))  # b'{"name": "John Doe"}'
     print(await fs._ls("/cv", detail=False))  # ["/cv/1"]
     print(await fs._glob("/cv/*/data"))  # ["/cv/1/data"]
 
-    await fs.engine.dispose()
+    await fs._close_conn()
 
 
 asyncio.run(main())

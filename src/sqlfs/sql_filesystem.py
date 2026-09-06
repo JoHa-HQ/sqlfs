@@ -19,7 +19,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import NoSuchTableError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 REQUIRED_COLUMNS = frozenset(
     {
@@ -59,34 +59,53 @@ class SQLFileSystem(AsyncFileSystem):
         super().__init__(**kwargs)
         self.url = url
         self.table_name = table
-        self.engine: AsyncEngine = create_async_engine(url)
         self._table: Table | None = None
+        self.engine: AsyncEngine = create_async_engine(url)
+        self._connection: AsyncConnection | None = None
 
     @property
     def table(self) -> Table:
         if self._table is None:
             raise RuntimeError(
-                "SQL filesystem table is not loaded; call await fs._load_table() first"
+                "SQL filesystem table is not loaded; call await fs._setup() first"
             )
         return self._table
 
-    async def _load_table(self) -> None:
+    @property
+    def connection(self) -> AsyncConnection:
+        if self._connection is None:
+            raise RuntimeError(
+                "SQL filesystem connection is not open; call await fs._setup() first"
+            )
+        return self._connection
+
+    async def _close_conn(self) -> None:
+        if self._connection is not None:
+            await self._connection.close()
+            self._connection = None
+        await self.engine.dispose()
+
+    async def _setup(self) -> None:
+        # Establish connection
+        if self._connection is None:
+            self._connection = await self.engine.connect()
+        # Reflect fs_node schema
         try:
-            async with self.engine.connect() as connection:
-                self._table = await connection.run_sync(
+            async with self.connection.begin():
+                self._table = await self.connection.run_sync(
                     lambda sync_conn: Table(
                         self.table_name, MetaData(), autoload_with=sync_conn
                     )
                 )
         except NoSuchTableError as exc:
-            await self.engine.dispose()
+            await self._close_conn()
             raise ValueError(
                 f"SQL filesystem table does not exist: {self.table_name!r}"
             ) from exc
 
         missing_columns = REQUIRED_COLUMNS.difference(self.table.c.keys())
         if missing_columns:
-            await self.engine.dispose()
+            await self._close_conn()
             missing = ", ".join(sorted(missing_columns))
             raise ValueError(
                 f"SQL filesystem table {self.table_name!r} "
@@ -121,8 +140,8 @@ class SQLFileSystem(AsyncFileSystem):
         return "" if parent == PurePosixPath("/") else str(parent)
 
     async def _row(self, path: str) -> RowMapping | None:
-        async with self.engine.connect() as connection:
-            result = await connection.execute(
+        async with self.connection.begin():
+            result = await self.connection.execute(
                 select(*self._node_columns()).where(self.table.c.path == path)
             )
             return result.mappings().first()
@@ -176,8 +195,8 @@ class SQLFileSystem(AsyncFileSystem):
                 raise NotADirectoryError(parent)
 
         now = time.time()
-        async with self.engine.begin() as connection:
-            await connection.execute(
+        async with self.connection.begin():
+            await self.connection.execute(
                 self.table.insert().values(
                     path=path,
                     parent=parent,
@@ -237,8 +256,8 @@ class SQLFileSystem(AsyncFileSystem):
             "mtime": now,
             "ctime": now,
         }
-        async with self.engine.begin() as connection:
-            await connection.execute(self.table.insert().values(**values))
+        async with self.connection.begin():
+            await self.connection.execute(self.table.insert().values(**values))
 
     async def _update_file(
         self,
@@ -247,8 +266,8 @@ class SQLFileSystem(AsyncFileSystem):
         size: int,
         timestamp: float,
     ) -> None:
-        async with self.engine.begin() as connection:
-            await connection.execute(
+        async with self.connection.begin():
+            await self.connection.execute(
                 update(self.table)
                 .where(self.table.c.path == path)
                 .values(
@@ -277,8 +296,8 @@ class SQLFileSystem(AsyncFileSystem):
             raise IsADirectoryError(path)
 
         data = self._content_as_bytes(row.get("content"))
-        async with self.engine.begin() as connection:
-            await connection.execute(
+        async with self.connection.begin():
+            await self.connection.execute(
                 update(self.table)
                 .where(self.table.c.path == path)
                 .values(atime=time.time())
@@ -311,8 +330,8 @@ class SQLFileSystem(AsyncFileSystem):
                 return [info] if detail else [path]
 
         parent = "" if path == "/" else path
-        async with self.engine.connect() as connection:
-            result = await connection.execute(
+        async with self.connection.begin():
+            result = await self.connection.execute(
                 select(*self._node_columns())
                 .where(self.table.c.parent == parent)
                 .order_by(self.table.c.path)
@@ -330,8 +349,8 @@ class SQLFileSystem(AsyncFileSystem):
         info = self._info_from_row(row)
         if info["type"] == "directory":
             raise IsADirectoryError(path)
-        async with self.engine.begin() as connection:
-            await connection.execute(
+        async with self.connection.begin():
+            await self.connection.execute(
                 delete(self.table).where(self.table.c.path == path)
             )
 
@@ -366,25 +385,26 @@ class SQLFileSystem(AsyncFileSystem):
             await self._rm_file(path)
             return
 
-        async with self.engine.begin() as connection:
-            if not recursive:
-                result = await connection.execute(
+        if not recursive:
+            async with self.connection.begin():
+                result = await self.connection.execute(
                     select(self.table.c.path)
                     .where(self.table.c.parent == path)
                     .limit(1)
                 )
                 if result.first() is not None:
                     raise OSError(f"Directory not empty: {path}")
-                await connection.execute(
+                await self.connection.execute(
                     delete(self.table).where(self.table.c.path == path)
                 )
-                return
+            return
 
-            escaped_path = (
-                path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            )
-            descendants = self.table.c.path.like(f"{escaped_path}/%", escape="\\")
-            await connection.execute(
+        escaped_path = (
+            path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        descendants = self.table.c.path.like(f"{escaped_path}/%", escape="\\")
+        async with self.connection.begin():
+            await self.connection.execute(
                 delete(self.table).where((self.table.c.path == path) | descendants)
             )
 

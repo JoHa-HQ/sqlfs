@@ -192,5 +192,5 @@ async def test_content_type_is_required_by_schema(incomplete_async_url: str) -> 
         asynchronous=True,
     )
     with pytest.raises(ValueError, match="content_type"):
-        await fs._load_table()
-    await fs.engine.dispose()
+        await fs._setup()
+    await fs._close_conn()
