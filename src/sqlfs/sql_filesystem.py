@@ -53,7 +53,7 @@ class _SQLFileWriter(BytesIO):
 
 class SQLFileSystem(AsyncFileSystem):
     protocol = "sql"
-    root_marker = "/"
+    root_marker = ""
 
     def __init__(self, url: str, table: str = "fs_node", **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -129,15 +129,18 @@ class SQLFileSystem(AsyncFileSystem):
     @classmethod
     def _strip_protocol(cls, path: str | PathLike[str]) -> str:
         stripped = super()._strip_protocol(path)
-        return str(PurePosixPath(f"/{stripped.lstrip('/')}"))
+        if not stripped:
+            return ""
+        return str(PurePosixPath(stripped.lstrip("/")))
 
     @classmethod
     def _parent(cls, path: str) -> str:
-        posix_path = PurePosixPath(path)
-        if posix_path == PurePosixPath("/"):
+        if not path:
             return ""
-        parent = posix_path.parent
-        return "" if parent == PurePosixPath("/") else str(parent)
+        parent = PurePosixPath(path).parent
+        if parent in (PurePosixPath("."), PurePosixPath("/")):
+            return ""
+        return str(parent)
 
     async def _row(self, path: str) -> RowMapping | None:
         result = await self.connection.execute(
@@ -166,7 +169,7 @@ class SQLFileSystem(AsyncFileSystem):
         **kwargs: Any,
     ) -> None:
         path = self._strip_protocol(path)
-        if path == "/":
+        if not path:
             if not exist_ok:
                 raise FileExistsError(path)
             return
@@ -220,7 +223,7 @@ class SQLFileSystem(AsyncFileSystem):
         **kwargs: Any,
     ) -> None:
         path = self._strip_protocol(path)
-        if path == "/":
+        if not path:
             raise IsADirectoryError(path)
         if mode not in {"create", "overwrite"}:
             raise ValueError(f"unsupported write mode: {mode!r}")
@@ -233,7 +236,8 @@ class SQLFileSystem(AsyncFileSystem):
             type_coerce(payload.decode("utf-8"), Text), self.table.c.content.type
         )
         parent = self._parent(path)
-        await self._mkdir(parent or "/", create_parents=True, exist_ok=True)
+        if parent:
+            await self._mkdir(parent, create_parents=True, exist_ok=True)
         now = time.time()
         row = await self._row(path)
 
@@ -305,8 +309,8 @@ class SQLFileSystem(AsyncFileSystem):
 
     async def _info(self, path: str, **kwargs: Any) -> dict[str, Any]:
         path = self._strip_protocol(path)
-        if path == "/":
-            return {"name": "/", "type": "directory", "size": 0}
+        if not path:
+            return {"name": "", "type": "directory", "size": 0}
         row = await self._row(path)
         if row is None:
             raise FileNotFoundError(path)
@@ -314,13 +318,13 @@ class SQLFileSystem(AsyncFileSystem):
 
     async def _exists(self, path: str, **kwargs: Any) -> bool:
         path = self._strip_protocol(path)
-        return path == "/" or await self._row(path) is not None
+        return not path or await self._row(path) is not None
 
     async def _ls(
         self, path: str, detail: bool = True, **kwargs: Any
     ) -> list[str] | list[dict[str, Any]]:
         path = self._strip_protocol(path)
-        if path != "/":
+        if path:
             row = await self._row(path)
             if row is None:
                 raise FileNotFoundError(path)
@@ -328,7 +332,7 @@ class SQLFileSystem(AsyncFileSystem):
             if info["type"] == "file":
                 return [info] if detail else [path]
 
-        parent = "" if path == "/" else path
+        parent = path
         result = await self.connection.execute(
             select(*self._node_columns())
             .where(self.table.c.parent == parent)
@@ -373,7 +377,7 @@ class SQLFileSystem(AsyncFileSystem):
             return
 
         path = self._strip_protocol(path)
-        if path == "/":
+        if not path:
             raise ValueError("Cannot remove root")
         row = await self._row(path)
         if row is None:
