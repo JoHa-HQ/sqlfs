@@ -140,11 +140,10 @@ class SQLFileSystem(AsyncFileSystem):
         return "" if parent == PurePosixPath("/") else str(parent)
 
     async def _row(self, path: str) -> RowMapping | None:
-        async with self.connection.begin():
-            result = await self.connection.execute(
-                select(*self._node_columns()).where(self.table.c.path == path)
-            )
-            return result.mappings().first()
+        result = await self.connection.execute(
+            select(*self._node_columns()).where(self.table.c.path == path)
+        )
+        return result.mappings().first()
 
     @staticmethod
     def _info_from_row(row: RowMapping) -> dict[str, Any]:
@@ -195,20 +194,20 @@ class SQLFileSystem(AsyncFileSystem):
                 raise NotADirectoryError(parent)
 
         now = time.time()
-        async with self.connection.begin():
-            await self.connection.execute(
-                self.table.insert().values(
-                    path=path,
-                    parent=parent,
-                    type="dir",
-                    content_type=None,
-                    content=None,
-                    size=0,
-                    atime=now,
-                    mtime=now,
-                    ctime=now,
-                )
+        await self.connection.execute(
+            self.table.insert().values(
+                path=path,
+                parent=parent,
+                type="dir",
+                content_type=None,
+                content=None,
+                size=0,
+                atime=now,
+                mtime=now,
+                ctime=now,
             )
+        )
+        await self.connection.commit()
 
     async def _makedirs(self, path: str, exist_ok: bool = False) -> None:
         await self._mkdir(path, create_parents=True, exist_ok=exist_ok)
@@ -256,8 +255,8 @@ class SQLFileSystem(AsyncFileSystem):
             "mtime": now,
             "ctime": now,
         }
-        async with self.connection.begin():
-            await self.connection.execute(self.table.insert().values(**values))
+        await self.connection.execute(self.table.insert().values(**values))
+        await self.connection.commit()
 
     async def _update_file(
         self,
@@ -266,19 +265,19 @@ class SQLFileSystem(AsyncFileSystem):
         size: int,
         timestamp: float,
     ) -> None:
-        async with self.connection.begin():
-            await self.connection.execute(
-                update(self.table)
-                .where(self.table.c.path == path)
-                .values(
-                    type="file",
-                    content_type="application/json",
-                    content=content,
-                    size=size,
-                    mtime=timestamp,
-                    ctime=timestamp,
-                )
+        await self.connection.execute(
+            update(self.table)
+            .where(self.table.c.path == path)
+            .values(
+                type="file",
+                content_type="application/json",
+                content=content,
+                size=size,
+                mtime=timestamp,
+                ctime=timestamp,
             )
+        )
+        await self.connection.commit()
 
     async def _cat_file(
         self,
@@ -296,12 +295,12 @@ class SQLFileSystem(AsyncFileSystem):
             raise IsADirectoryError(path)
 
         data = self._content_as_bytes(row.get("content"))
-        async with self.connection.begin():
-            await self.connection.execute(
-                update(self.table)
-                .where(self.table.c.path == path)
-                .values(atime=time.time())
-            )
+        await self.connection.execute(
+            update(self.table)
+            .where(self.table.c.path == path)
+            .values(atime=time.time())
+        )
+        await self.connection.commit()
         return data[start:end]
 
     async def _info(self, path: str, **kwargs: Any) -> dict[str, Any]:
@@ -330,13 +329,12 @@ class SQLFileSystem(AsyncFileSystem):
                 return [info] if detail else [path]
 
         parent = "" if path == "/" else path
-        async with self.connection.begin():
-            result = await self.connection.execute(
-                select(*self._node_columns())
-                .where(self.table.c.parent == parent)
-                .order_by(self.table.c.path)
-            )
-            rows = result.mappings().all()
+        result = await self.connection.execute(
+            select(*self._node_columns())
+            .where(self.table.c.parent == parent)
+            .order_by(self.table.c.path)
+        )
+        rows = result.mappings().all()
         if detail:
             return [self._info_from_row(row) for row in rows]
         return [row["path"] for row in rows]
@@ -349,10 +347,10 @@ class SQLFileSystem(AsyncFileSystem):
         info = self._info_from_row(row)
         if info["type"] == "directory":
             raise IsADirectoryError(path)
-        async with self.connection.begin():
-            await self.connection.execute(
-                delete(self.table).where(self.table.c.path == path)
-            )
+        await self.connection.execute(
+            delete(self.table).where(self.table.c.path == path)
+        )
+        await self.connection.commit()
 
     async def _rmdir(self, path: str) -> None:
         await self._rm(path, recursive=False)
@@ -386,27 +384,25 @@ class SQLFileSystem(AsyncFileSystem):
             return
 
         if not recursive:
-            async with self.connection.begin():
-                result = await self.connection.execute(
-                    select(self.table.c.path)
-                    .where(self.table.c.parent == path)
-                    .limit(1)
-                )
-                if result.first() is not None:
-                    raise OSError(f"Directory not empty: {path}")
-                await self.connection.execute(
-                    delete(self.table).where(self.table.c.path == path)
-                )
+            result = await self.connection.execute(
+                select(self.table.c.path).where(self.table.c.parent == path).limit(1)
+            )
+            if result.first() is not None:
+                raise OSError(f"Directory not empty: {path}")
+            await self.connection.execute(
+                delete(self.table).where(self.table.c.path == path)
+            )
+            await self.connection.commit()
             return
 
         escaped_path = (
             path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         )
         descendants = self.table.c.path.like(f"{escaped_path}/%", escape="\\")
-        async with self.connection.begin():
-            await self.connection.execute(
-                delete(self.table).where((self.table.c.path == path) | descendants)
-            )
+        await self.connection.execute(
+            delete(self.table).where((self.table.c.path == path) | descendants)
+        )
+        await self.connection.commit()
 
     def _open(
         self,
