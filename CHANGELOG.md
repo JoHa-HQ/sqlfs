@@ -1,3 +1,15 @@
+## v0.2.0 (2026-09-10)
+
+### Feat
+
+- **#14**: switch SQLFileSystem to async SQLAlchemy
+
+### Refactor
+
+- **#14**: normalize SQLFileSystem paths to relative form
+- **#14**: remove unnecessary begin() wrappers
+- **#14**: keep a long-lived connection on SQLFileSystem
+
 ## v0.1.1 (2026-08-28)
 
 ### Fix
