@@ -199,6 +199,9 @@ cython_debug/
 #   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
 #   and can be added to the global gitignore or merged into this file. However, if you prefer, 
 
+# Local multi-root editor workspaces (machine-specific paths)
+*.code-workspace
+
 # Local tool caches
 .prek-home/
 .uv-cache/
